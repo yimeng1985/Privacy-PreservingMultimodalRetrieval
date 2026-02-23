@@ -776,6 +776,13 @@ class GaussianDiffusion:
         elif self.loss_type == LossType.MSE or self.loss_type == LossType.RESCALED_MSE:
             model_output = model(x_t, self._scale_timesteps(t), **model_kwargs)
 
+            # Cast to FP32 for numerically stable loss computation.
+            # This is critical when training with FP16: the model output may
+            # be FP16 (or mixed), and the VLB loss involves exp/log/KL-div
+            # operations that need FP32 precision to avoid gradient overflow.
+            if model_output.dtype != th.float32:
+                model_output = model_output.float()
+
             if self.model_var_type in [
                 ModelVarType.LEARNED,
                 ModelVarType.LEARNED_RANGE,

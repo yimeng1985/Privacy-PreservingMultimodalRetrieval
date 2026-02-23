@@ -145,6 +145,12 @@ class CheckpointFunction(th.autograd.Function):
         ctx.run_function = run_function
         ctx.input_tensors = list(args[:length])
         ctx.input_params = list(args[length:])
+        # Save autocast state so backward recomputation uses the same precision
+        ctx.gpu_autocast_kwargs = {
+            "enabled": th.is_autocast_enabled("cuda"),
+            "dtype": th.get_autocast_dtype("cuda"),
+            "cache_enabled": th.is_autocast_cache_enabled(),
+        }
         with th.no_grad():
             output_tensors = ctx.run_function(*ctx.input_tensors)
         return output_tensors
@@ -153,11 +159,13 @@ class CheckpointFunction(th.autograd.Function):
     def backward(ctx, *output_grads):
         ctx.input_tensors = [x.detach().requires_grad_(True) for x in ctx.input_tensors]
         with th.enable_grad():
-            # Fixes a bug where the first op in run_function modifies the
-            # Tensor storage in place, which is not allowed for detach()'d
-            # Tensors.
-            shallow_copies = [x.view_as(x) for x in ctx.input_tensors]
-            output_tensors = ctx.run_function(*shallow_copies)
+            # Re-enter autocast context for gradient checkpointing recomputation
+            with th.amp.autocast("cuda", **ctx.gpu_autocast_kwargs):
+                # Fixes a bug where the first op in run_function modifies the
+                # Tensor storage in place, which is not allowed for detach()'d
+                # Tensors.
+                shallow_copies = [x.view_as(x) for x in ctx.input_tensors]
+                output_tensors = ctx.run_function(*shallow_copies)
         input_grads = th.autograd.grad(
             output_tensors,
             ctx.input_tensors + ctx.input_params,

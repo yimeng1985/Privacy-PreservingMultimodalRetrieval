@@ -43,7 +43,7 @@ class ClassifierFreeGuidanceModel(nn.Module):
         :param x: noisy image [N, C, H, W]
         :param timesteps: [N] timestep tensor
         :param clip_embed: [N, D] CLIP embedding tensor
-        :return: guided noise prediction
+        :return: guided noise prediction (with optional variance channels)
         """
         assert clip_embed is not None, "clip_embed is required for CFG sampling"
 
@@ -57,5 +57,17 @@ class ClassifierFreeGuidanceModel(nn.Module):
         null_embed = th.zeros_like(clip_embed)
         uncond_output = self.model(x, timesteps, clip_embed=null_embed, **kwargs)
 
-        # Classifier-free guidance formula
-        return uncond_output + self.guidance_scale * (cond_output - uncond_output)
+        # When learn_sigma=True, model outputs [noise, variance] concatenated
+        # along channel dim. CFG should only apply to the noise part.
+        C = x.shape[1]  # number of image channels (3)
+        if cond_output.shape[1] > C:
+            # Split into noise prediction and variance prediction
+            cond_eps, cond_var = cond_output[:, :C], cond_output[:, C:]
+            uncond_eps = uncond_output[:, :C]
+            # Apply guidance only to noise prediction
+            guided_eps = uncond_eps + self.guidance_scale * (cond_eps - uncond_eps)
+            # Use conditional model's variance prediction (don't guide variance)
+            return th.cat([guided_eps, cond_var], dim=1)
+        else:
+            # No learned variance, apply guidance to full output
+            return uncond_output + self.guidance_scale * (cond_output - uncond_output)

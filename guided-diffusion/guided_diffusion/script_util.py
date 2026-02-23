@@ -46,27 +46,32 @@ def classifier_defaults():
 def clip_model_and_diffusion_defaults():
     """
     Defaults for CLIP-conditioned diffusion training.
+    Follows the ID3PM paper and guided-diffusion 64x64 config.
     """
     res = dict(
         image_size=64,
-        num_channels=128,
-        num_res_blocks=2,
+        num_channels=192,
+        num_res_blocks=3,
         num_heads=4,
         num_heads_upsample=-1,
         num_head_channels=-1,
-        attention_resolutions="16,8",
+        attention_resolutions="32,16,8",
         channel_mult="",
         dropout=0.0,
         use_checkpoint=False,
         use_scale_shift_norm=True,
-        resblock_updown=False,
+        resblock_updown=True,
         use_fp16=False,
         use_new_attention_order=False,
         clip_embed_dim=CLIP_EMBED_DIM,
         p_uncond=0.1,
-        guidance_scale=3.0,
+        guidance_scale=2.0,
     )
     res.update(diffusion_defaults())
+    # Override diffusion defaults to match the paper
+    res["learn_sigma"] = True
+    res["noise_schedule"] = "cosine"
+    res["rescale_learned_sigmas"] = True
     return res
 
 
@@ -100,6 +105,8 @@ def create_clip_model_and_diffusion(
     """
     Create both model and diffusion for CLIP-conditioned generation.
     """
+    # With AMP, the model must stay in FP32; autocast handles mixed precision.
+    # use_fp16 is only used by MixedPrecisionTrainer for AMP, not by the model.
     model = create_clip_model(
         image_size,
         num_channels,
@@ -114,7 +121,7 @@ def create_clip_model_and_diffusion(
         use_scale_shift_norm=use_scale_shift_norm,
         dropout=dropout,
         resblock_updown=resblock_updown,
-        use_fp16=use_fp16,
+        use_fp16=False,  # Always False: AMP handles FP16 at op level
         use_new_attention_order=use_new_attention_order,
         clip_embed_dim=clip_embed_dim,
     )

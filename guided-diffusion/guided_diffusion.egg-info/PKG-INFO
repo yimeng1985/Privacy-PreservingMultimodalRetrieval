@@ -1,0 +1,10 @@
+Metadata-Version: 2.1
+Name: guided-diffusion
+Version: 0.0.0
+Requires-Dist: blobfile>=1.0.5
+Requires-Dist: torch
+Requires-Dist: tqdm
+Requires-Dist: open_clip_torch
+Requires-Dist: Pillow
+Requires-Dist: numpy
+Requires-Dist: mpi4py

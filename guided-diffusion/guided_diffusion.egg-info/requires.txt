@@ -1,0 +1,7 @@
+blobfile>=1.0.5
+torch
+tqdm
+open_clip_torch
+Pillow
+numpy
+mpi4py

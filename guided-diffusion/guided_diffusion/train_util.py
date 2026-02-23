@@ -38,6 +38,9 @@ class TrainLoop:
         schedule_sampler=None,
         weight_decay=0.0,
         lr_anneal_steps=0,
+        early_stop_patience=0,
+        keep_last_n_checkpoints=3,
+        eval_interval=0,
     ):
         self.model = model
         self.diffusion = diffusion
@@ -58,10 +61,21 @@ class TrainLoop:
         self.schedule_sampler = schedule_sampler or UniformSampler(diffusion)
         self.weight_decay = weight_decay
         self.lr_anneal_steps = lr_anneal_steps
+        self.early_stop_patience = early_stop_patience
+        self.keep_last_n_checkpoints = keep_last_n_checkpoints
+        # How often to evaluate the EMA loss for best-model / early-stopping.
+        # Defaults to save_interval if not specified.
+        self.eval_interval = eval_interval if eval_interval > 0 else save_interval
 
         self.step = 0
         self.resume_step = 0
         self.global_batch = self.batch_size * dist.get_world_size()
+
+        # Best-model & early stopping tracking
+        self.best_loss = float("inf")
+        self._loss_accum = 0.0
+        self._loss_count = 0
+        self._no_improve_count = 0  # consecutive eval windows without improvement
 
         self.sync_cuda = th.cuda.is_available()
 
@@ -75,8 +89,18 @@ class TrainLoop:
         self.opt = AdamW(
             self.mp_trainer.master_params, lr=self.lr, weight_decay=self.weight_decay
         )
+        self._optimizer_loaded = False  # Track whether optimizer state was loaded
+        self.warmup_steps = 0  # Set to >0 when we need warmup
         if self.resume_step:
             self._load_optimizer_state()
+            if not self._optimizer_loaded:
+                # Optimizer state not loaded — use lr warmup to let AdamW build
+                # proper per-parameter variance estimates before applying full lr.
+                # Without this, AdamW's adaptive lr can cause disproportionately
+                # large updates for low-variance parameters, risking collapse.
+                self.warmup_steps = 2000
+                logger.log(f"Optimizer state not loaded. Using lr warmup for "
+                           f"{self.warmup_steps} steps (0 → {self.lr}).")
             # Model was resumed, either due to a restart or a checkpoint
             # being specified at the command line.
             self.ema_params = [
@@ -148,7 +172,17 @@ class TrainLoop:
             state_dict = dist_util.load_state_dict(
                 opt_checkpoint, map_location=dist_util.dev()
             )
-            self.opt.load_state_dict(state_dict)
+            try:
+                self.opt.load_state_dict(state_dict)
+                self._optimizer_loaded = True
+                logger.log("Optimizer state loaded successfully.")
+            except (ValueError, RuntimeError) as e:
+                logger.log(
+                    f"WARNING: Could not load optimizer state (likely format change "
+                    f"from legacy FP16 to AMP): {e}. "
+                    f"Optimizer will restart from scratch. Training will continue normally."
+                )
+                self._optimizer_loaded = False
 
     def run_loop(self):
         while (
@@ -159,10 +193,19 @@ class TrainLoop:
             self.run_step(batch, cond)
             if self.step % self.log_interval == 0:
                 logger.dumpkvs()
-            if self.step % self.save_interval == 0:
+            if self.step % self.save_interval == 0 and self.step > 0:
                 self.save()
                 # Run for a finite amount of time in integration tests.
-                if os.environ.get("DIFFUSION_TRAINING_TEST", "") and self.step > 0:
+                if os.environ.get("DIFFUSION_TRAINING_TEST", ""):
+                    return
+            # Best-model evaluation & early stopping check
+            if self.step % self.eval_interval == 0 and self.step > 0:
+                if self._check_best_and_early_stop():
+                    logger.log(
+                        f"Early stopping triggered: no improvement for "
+                        f"{self.early_stop_patience} eval windows. "
+                        f"Best loss: {self.best_loss:.6f}"
+                    )
                     return
             self.step += 1
         # Save the last checkpoint if it wasn't already saved.
@@ -196,11 +239,12 @@ class TrainLoop:
                 model_kwargs=micro_cond,
             )
 
-            if last_batch or not self.use_ddp:
-                losses = compute_losses()
-            else:
-                with self.ddp_model.no_sync():
+            with self.mp_trainer.autocast_ctx():
+                if last_batch or not self.use_ddp:
                     losses = compute_losses()
+                else:
+                    with self.ddp_model.no_sync():
+                        losses = compute_losses()
 
             if isinstance(self.schedule_sampler, LossAwareSampler):
                 self.schedule_sampler.update_with_local_losses(
@@ -211,6 +255,7 @@ class TrainLoop:
             log_loss_dict(
                 self.diffusion, t, {k: v * weights for k, v in losses.items()}
             )
+            self._accumulate_loss(loss.item())
             self.mp_trainer.backward(loss)
 
     def _update_ema(self):
@@ -218,6 +263,14 @@ class TrainLoop:
             update_ema(params, self.mp_trainer.master_params, rate=rate)
 
     def _anneal_lr(self):
+        # Apply warmup if optimizer was not loaded (fresh optimizer with pretrained model)
+        if self.warmup_steps > 0 and self.step < self.warmup_steps:
+            warmup_factor = self.step / self.warmup_steps
+            lr = self.lr * warmup_factor
+            for param_group in self.opt.param_groups:
+                param_group["lr"] = lr
+            return
+
         if not self.lr_anneal_steps:
             return
         frac_done = (self.step + self.resume_step) / self.lr_anneal_steps
@@ -228,6 +281,64 @@ class TrainLoop:
     def log_step(self):
         logger.logkv("step", self.step + self.resume_step)
         logger.logkv("samples", (self.step + self.resume_step + 1) * self.global_batch)
+
+    def _accumulate_loss(self, loss_val):
+        """Track running average loss for best-model evaluation."""
+        self._loss_accum += loss_val
+        self._loss_count += 1
+
+    def _check_best_and_early_stop(self):
+        """
+        Evaluate the average loss over the last eval window.
+        Save the model if it's the best so far.
+        Return True if early stopping should trigger.
+        """
+        if self._loss_count == 0:
+            return False
+
+        avg_loss = self._loss_accum / self._loss_count
+        self._loss_accum = 0.0
+        self._loss_count = 0
+
+        global_step = self.step + self.resume_step
+        logger.log(
+            f"[Eval @ step {global_step}] avg_loss={avg_loss:.6f}, "
+            f"best_loss={self.best_loss:.6f}"
+        )
+
+        if avg_loss < self.best_loss:
+            self.best_loss = avg_loss
+            self._no_improve_count = 0
+            self._save_best()
+            logger.log(f"  → New best model saved (loss={avg_loss:.6f})")
+        else:
+            self._no_improve_count += 1
+            logger.log(
+                f"  → No improvement ({self._no_improve_count}/"
+                f"{self.early_stop_patience if self.early_stop_patience > 0 else '∞'})"
+            )
+
+        if self.early_stop_patience > 0 and self._no_improve_count >= self.early_stop_patience:
+            return True
+        return False
+
+    def _save_best(self):
+        """Save best model and EMA weights (overwrite previous best)."""
+        if dist.get_rank() != 0:
+            return
+        logdir = get_blob_logdir()
+        # Save best model
+        state_dict = self.mp_trainer.master_params_to_state_dict(
+            self.mp_trainer.master_params
+        )
+        with bf.BlobFile(bf.join(logdir, "best_model.pt"), "wb") as f:
+            th.save(state_dict, f)
+        # Save best EMA
+        for rate, params in zip(self.ema_rate, self.ema_params):
+            state_dict = self.mp_trainer.master_params_to_state_dict(params)
+            with bf.BlobFile(bf.join(logdir, f"best_ema_{rate}.pt"), "wb") as f:
+                th.save(state_dict, f)
+        logger.log(f"  → Best model checkpoint saved to {logdir}/best_model.pt")
 
     def save(self):
         def save_checkpoint(rate, params):
@@ -252,7 +363,40 @@ class TrainLoop:
             ) as f:
                 th.save(self.opt.state_dict(), f)
 
+        # Rotate old checkpoints: keep only the last N
+        if dist.get_rank() == 0 and self.keep_last_n_checkpoints > 0:
+            self._rotate_checkpoints()
+
         dist.barrier()
+
+    def _rotate_checkpoints(self):
+        """Delete old periodic checkpoints, keeping only the last N sets."""
+        logdir = get_blob_logdir()
+        import re
+        # Find all model checkpoint steps (exclude best_model.pt)
+        steps = sorted(set(
+            int(m.group(1))
+            for f in bf.listdir(logdir)
+            for m in [re.match(r"model(\d{6})\.pt$", f)]
+            if m
+        ))
+        if len(steps) <= self.keep_last_n_checkpoints:
+            return
+        steps_to_delete = steps[:-self.keep_last_n_checkpoints]
+        for s in steps_to_delete:
+            for pattern in [
+                f"model{s:06d}.pt",
+                f"opt{s:06d}.pt",
+            ]:
+                path = bf.join(logdir, pattern)
+                if bf.exists(path):
+                    bf.remove(path)
+            # Also remove EMA files for this step
+            for rate in self.ema_rate:
+                path = bf.join(logdir, f"ema_{rate}_{s:06d}.pt")
+                if bf.exists(path):
+                    bf.remove(path)
+            logger.log(f"Rotated old checkpoint: step {s}")
 
 
 def parse_resume_step_from_filename(filename):
