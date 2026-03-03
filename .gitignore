@@ -1,9 +1,10 @@
 images1024x1024.zip
 images1024x1024
 logs
-**logs**
-**results**
-embeds_clip/
-out_emb/
-runs/
-pretrained_models/
+reproduce/ID3PM/**logs**
+reproduce/IdDecoder/**results**
+reproduce/IdDecoder/embeds_clip/
+reproduce/IdDecoder/out_emb/
+reproduce/IdDecoder/runs/
+reproduce/IdDecoder/pretrained_models/
+reproduce/IdDecoder/celeba_hq/
