@@ -1,6 +1,6 @@
-images1024x1024.zip
-images1024x1024
-logs
+reproduce/ID3PM/images1024x1024.zip
+reproduce/ID3PM/images1024x1024
+reproduce/ID3PM/logs
 reproduce/ID3PM/**logs**
 reproduce/IdDecoder/**results**
 reproduce/IdDecoder/embeds_clip/
