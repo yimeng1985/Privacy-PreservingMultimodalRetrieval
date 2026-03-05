@@ -8,3 +8,4 @@ reproduce/IdDecoder/out_emb/
 reproduce/IdDecoder/runs/
 reproduce/IdDecoder/pretrained_models/
 reproduce/IdDecoder/celeba_hq/
+doc/

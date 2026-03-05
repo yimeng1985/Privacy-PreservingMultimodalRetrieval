@@ -1,0 +1,27 @@
+encoder:
+  model_id: "laion/CLIP-ViT-L-14-DataComp.XL-s13B-b90K"
+
+reconstructor:
+  embed_dim: 768
+  base_channels: 512
+
+training:
+  batch_size: 32
+  learning_rate: 0.0001
+  num_epochs: 50
+  lambda_lpips: 0.5
+  save_every: 5
+  log_every: 50
+
+selector:
+  patch_size: 16       # ViT-B/16 natural patch size
+  top_k_ratio: 0.15    # select top 15% patches
+  occlusion_mode: "mean"
+  eps: 0.001
+
+perturber:
+  epsilon: 0.03        # ~8/255 perturbation budget
+  alpha: 0.005         # PGD step size
+  num_steps: 10        # PGD iterations
+  lambda_util: 1.0     # utility preservation weight
+  lambda_smooth: 0.01  # TV smoothness weight
