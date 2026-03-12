@@ -9,3 +9,10 @@ reproduce/IdDecoder/runs/
 reproduce/IdDecoder/pretrained_models/
 reproduce/IdDecoder/celeba_hq/
 doc/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.idea/
+.vscode/
