@@ -139,25 +139,17 @@ set KMP_DUPLICATE_LIB_OK=TRUE
 准备一个图片目录（任意格式 jpg/png/...），越贴近你的业务域效果越好。
 
 ```bash
-python scripts/train_reconstructor.py \
-    --data_dir <你的图片目录> \
-    --output_dir checkpoints \
-    --config configs/default.yaml
+python scripts/train_reconstructor.py --data_dir reproduce/IdDecoder/celeba_hq/train --output_dir checkpoints --config configs/default.yaml
 ```
 
-- 默认训练 50 epoch，每 5 epoch 保存一次
+- 默认训练 50 epoch，每 5 epoch 保存一次，同时实时保存当前最优模型
 - 支持 `--resume checkpoints/reconstructor_epoch25.pth` 断点恢复
-- 产出：`checkpoints/reconstructor_epoch50.pth`
+- 推荐产出：`checkpoints/reconstructor_best.pth`（用于后续防御与基线对比）
 
 ### 4.3 Step 2 — 运行 SPAG 防御
 
 ```bash
-python scripts/run_defense.py \
-    --data_dir <测试图片目录> \
-    --reconstructor_ckpt checkpoints/reconstructor_epoch50.pth \
-    --output_dir results/defense \
-    --num_images 100 \
-    --num_vis 20
+python scripts/run_defense.py --data_dir reproduce/IdDecoder/celeba_hq/val --reconstructor_ckpt checkpoints/reconstructor_best.pth --output_dir results/defense --num_images 100 --num_vis 20
 ```
 
 - 对每张图自动执行：打分 → 选区 → PGD 扰动 → 评估指标
@@ -169,10 +161,10 @@ python scripts/run_defense.py \
 
 ```bash
 python scripts/eval_baseline.py \
-    --data_dir <测试图片目录> \
-    --reconstructor_ckpt checkpoints/reconstructor_epoch50.pth \
-    --output_dir results/baselines \
-    --num_images 50
+  --data_dir <测试图片目录> \
+  --reconstructor_ckpt checkpoints/reconstructor_best.pth \
+  --output_dir results/baselines \
+  --num_images 50
 ```
 
 将以下 5 种方法进行横向对比：
@@ -216,58 +208,3 @@ perturber:
   lambda_util: 1.0            # 效用保持权重
   lambda_smooth: 0.01         # TV 平滑正则权重
 ```
-
----
-
-## 6. 设计决策与思考
-
-### 为什么用 "隐私收益/语义代价" 比值选区？
-
-简单地选 "embedding 变化最大的块" 会严重伤害检索效用。比值 s_j = p_j / (u_j + ε) 优先选择那些"让反演变差很多、但对检索影响较小"的区域，实现更好的隐私-效用权衡。
-
-### 为什么用 Masked PGD 而不是全局噪声？
-
-- 全局均匀噪声效率低：大部分扰动浪费在对隐私无贡献的区域
-- PGD 是主动优化，方向对齐"让重建更差"的梯度，效率更高
-- Mask 约束进一步聚焦扰动预算到关键区域
-
-### 为什么 Reconstructor 用简单 CNN 而不是 GAN？
-
-MVP 阶段稳定性优先。GAN 训练不稳定，且影子模型的目的是提供"足够好"的梯度信号，不需要产生完美重建。后续 Phase 2 可替换为更强的 decoder 或 ensemble。
-
----
-
-## 7. 后续计划
-
-### Phase 1 当前（MVP 完成后）
-
-- [ ] 在完整数据集上训练 Reconstructor（CelebA-HQ / ImageNet 子集）
-- [ ] 运行完整防御流程，确认指标趋势正确
-- [ ] 消融实验：patch 大小 (8/16/32)、选择比例 (5%~50%)、PGD 步数 (5/10/20)
-- [ ] 对比不同遮蔽模式 (mean / zero / blur) 的效果差异
-
-### Phase 2 — 稳健性与迁移性
-
-- [ ] 训练多个不同架构的影子反演器 (ResNet decoder / U-Net decoder)，组成 ensemble
-- [ ] 测试对未知攻击结构的迁移性（攻击者用不同 decoder）
-- [ ] 引入 LPIPS 到打分阶段（替代纯 L1）
-- [ ] 使用 reproduce/ 下的 ID3PM 和 IdDecoder 作为更强的攻击器进行评估
-
-### Phase 3 — 可学习选择器（可选进阶）
-
-- [ ] 将 OcclusionSelector 升级为可学习的稀疏 gate 网络
-- [ ] 端到端优化 gate + perturbation（Gumbel-Softmax / Hard-Concrete）
-- [ ] 探索 token-level（ViT 内部特征层）选择，替代 pixel-level patch
-
-### 其它可探索方向
-
-- [ ] 效用侧评估：构建小型向量库，测试 Recall@K / mAP
-- [ ] 端侧延迟优化：减少遮蔽打分的前向次数（采样/分组策略）
-- [ ] 单步生成器：训练 feedforward 网络直接预测扰动，替代推理时 PGD 迭代
-
----
-
-## 8. 参考文献
-
-1. 文本领域：基于隐私神经元检测的 embedding 防御（稀疏维度扰动）
-2. 图像领域：基于 shadow reconstructor 重建损失梯度的对抗噪声防御

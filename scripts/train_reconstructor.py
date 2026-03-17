@@ -67,11 +67,13 @@ def train(args):
 
     # ---- Resume ----
     start_epoch = 0
+    best_loss = float('inf')
     if args.resume and os.path.isfile(args.resume):
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
         reconstructor.load_state_dict(ckpt['model_state_dict'])
         optimizer.load_state_dict(ckpt['optimizer_state_dict'])
         start_epoch = ckpt['epoch']
+        best_loss = ckpt.get('best_loss', ckpt.get('loss', float('inf')))
         print(f"Resumed from epoch {start_epoch}")
 
     # ---- Training ----
@@ -114,6 +116,19 @@ def train(args):
         print(f"Epoch {epoch+1}/{num_epochs}  avg_loss={avg_loss:.4f}  "
               f"time={elapsed:.1f}s")
 
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            best_path = os.path.join(args.output_dir, 'reconstructor_best.pth')
+            torch.save({
+                'epoch': epoch + 1,
+                'model_state_dict': reconstructor.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'loss': avg_loss,
+                'best_loss': best_loss,
+                'config': config,
+            }, best_path)
+            print(f"  New best checkpoint → {best_path} (best_loss={best_loss:.4f})")
+
         if (epoch + 1) % save_every == 0 or epoch + 1 == num_epochs:
             path = os.path.join(args.output_dir,
                                 f'reconstructor_epoch{epoch+1}.pth')
@@ -122,6 +137,7 @@ def train(args):
                 'model_state_dict': reconstructor.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'loss': avg_loss,
+                'best_loss': best_loss,
                 'config': config,
             }, path)
             print(f"  Saved checkpoint → {path}")
