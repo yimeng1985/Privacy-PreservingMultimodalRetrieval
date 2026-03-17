@@ -1,6 +1,4 @@
-# SPAG — 图像 Embedding 抗反演隐私保护系统
-
-> **S**parse **P**rivacy-region selection + **A**dversarial perturbation for image embeddin**G**s
+# 图像 Embedding 抗反演隐私保护系统
 
 ## 1. 项目概述
 
