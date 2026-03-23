@@ -5,8 +5,6 @@
 
 ## 1. 当前实现与设计对应关系
 
-当前代码已按 `new.markdown` 的六阶段实现：
-
 1. **影子重建模型训练**：`Model/models/reconstructor.py` + `scripts/train_reconstructor.py`
 2. **块级遮蔽敏感性分析（p_j）**：`Model/models/selector.py` (`OcclusionAnalyzer.compute_sensitivity`)
 3. **候选区域筛选（top-M）**：`Model/models/selector.py` (`select_candidates`)
