@@ -1,176 +1,151 @@
-# 图像 Embedding 抗反演隐私保护系统
+# Model — 图像局部隐私保护系统
 
-## 1. 项目概述
+本项目用于“客户端本地编码图像 → 上传 embedding → 云端检索”场景下的抗反演防御。  
+核心目标：只保护真正敏感、且对重建攻击有贡献的局部区域，避免整图一刀切扰动。
 
-在"客户端本地编码图像 → 上传 embedding → 云端向量数据库检索"的场景下，embedding 可能被攻击者反演重建出原始图像，造成隐私泄露。
+## 1. 当前实现与设计对应关系
 
-本项目在**客户端侧**部署前置防御：通过 **遮蔽打分选择隐私关键区域** + **重建引导的局部对抗扰动（Masked PGD）** 生成受保护 embedding，在保留检索效用的同时显著降低反演重建质量。
+当前代码已按 `new.markdown` 的六阶段实现：
 
-### 核心流程
+1. **影子重建模型训练**：`Model/models/reconstructor.py` + `scripts/train_reconstructor.py`
+2. **块级遮蔽敏感性分析（p_j）**：`Model/models/selector.py` (`OcclusionAnalyzer.compute_sensitivity`)
+3. **候选区域筛选（top-M）**：`Model/models/selector.py` (`select_candidates`)
+4. **VLM语义隐私判断（q_j）**：`Model/models/vlm.py`（默认 `MockVLMJudge`，可替换真实VLM）
+5. **分数融合（s_j）**：`Model/models/fusion.py` (`ScoreFusion`)
+6. **局部自适应保护**：`Model/models/protector.py` (`AdaptiveProtector`)
 
-```text
-原始图像 x
-  │
-  ├─ ① CLIP 编码器 E  ──→  z = E(x)          原始 embedding
-  │
-  ├─ ② 遮蔽打分 (OcclusionSelector)
-  │     对每个 patch 遮蔽后计算：
-  │       u_j  = 语义代价 (embedding 漂移)
-  │       p_j  = 隐私收益 (重建损失增量)
-  │       s_j  = p_j / (u_j + ε)    ← 综合得分
-  │     选 top-k patch → 二值 mask M
-  │
-  ├─ ③ Masked PGD 扰动 (MaskedPGD)
-  │     仅对 M 标记区域施加对抗扰动 δ
-  │     优化: max L_rec(R(E(x')), x) - λ_u·drift - λ_s·TV
-  │     得到 x' = clip(x + M ⊙ δ, 0, 1)
-  │
-  └─ ④ 受保护 embedding  z' = E(x')          上传到云端
-```
+融合核心：
+
+$$
+s_j = f(p_j, q_j)
+$$
+
+默认实现支持乘性融合与线性融合（见 `configs/default.yaml` 的 `fusion.mode`）。
 
 ---
 
-## 2. 项目结构
+## 2. 目录结构（当前）
 
 ```text
 GraduationProject/
-├── configs/
-│   └── default.yaml              # 所有超参数统一配置
-├── spag/                          # 核心库
+├── Model/
 │   ├── __init__.py
-│   ├── models/
-│   │   ├── __init__.py            # 惰性导入
-│   │   ├── encoder.py             # CLIPEncoder — CLIP ViT-B/16 封装
-│   │   ├── reconstructor.py       # Reconstructor — 影子反演 CNN 解码器
-│   │   ├── selector.py            # OcclusionSelector — 遮蔽打分 + top-k 选择
-│   │   └── perturber.py           # MaskedPGD — 局部对抗扰动生成
+│   ├── data/
+│   │   └── dataset.py
 │   ├── eval/
-│   │   ├── __init__.py
-│   │   └── metrics.py             # PSNR / SSIM / LPIPS / cosine drift
-│   └── data/
-│       ├── __init__.py
-│       └── dataset.py             # ImageDataset (递归加载图片目录)
+│   │   └── metrics.py
+│   └── models/
+│       ├── encoder.py
+│       ├── reconstructor.py
+│       ├── selector.py
+│       ├── vlm.py
+│       ├── fusion.py
+│       ├── protector.py
+│       └── perturber.py
 ├── scripts/
-│   ├── train_reconstructor.py     # Step 1: 训练影子反演模型
-│   ├── run_defense.py             # Step 2: 运行 SPAG 防御 + 评估
-│   └── eval_baseline.py           # Step 3: 对比基线实验
-├── reproduce/                     # 参考文献复现代码
-│   ├── ID3PM/                     # 基于扩散模型的反演器
-│   └── IdDecoder/                 # 基于 StyleGAN 的反演器
-├── design.md                      # 详细设计文档
-├── requirements.txt               # Python 依赖
-└── README.md                      # ← 本文件
+│   ├── train_reconstructor.py
+│   ├── run_defense.py
+│   └── eval_baseline.py
+├── configs/
+│   └── default.yaml
+├── checkpoints/
+├── requirements.txt
+└── README.md
 ```
 
----
-
-## 3. 各模块说明
-
-### 3.1 CLIPEncoder ([spag/models/encoder.py](spag/models/encoder.py))
-
-- 使用 `open_clip` 加载 `ViT-B/16 (OpenAI)` 预训练权重
-- 输出 512 维 L2 归一化 embedding
-- 提供 `encode()` (无梯度) 和 `encode_with_grad()` (保留计算图供 PGD 反传)
-- 所有参数冻结，不参与训练
-
-### 3.2 Reconstructor ([spag/models/reconstructor.py](spag/models/reconstructor.py))
-
-- **角色**：影子反演模型 (Shadow Reconstructor)，模拟攻击者
-- **架构**：FC 投影 → 5 层 ConvTranspose2d + ResBlock（512→256→128→64→32→3）
-- **输入**：512 维 embedding → **输出**：224×224 RGB 图像 [0,1]
-- **训练目标**：L1 + λ·LPIPS（不使用 GAN 以保证训练稳定）
-
-### 3.3 OcclusionSelector ([spag/models/selector.py](spag/models/selector.py))
-
-- 将图像分为 16×16 patch（对齐 ViT patch 划分）
-- 逐个遮蔽 patch 后计算：
-  - **u_j**（语义代价）= 1 − cos(E(x_{-j}), E(x))
-  - **p_j**（隐私收益）= L1_rec(R(E(x_{-j})), x) − L1_rec(R(E(x)), x)，负值 clamp 为 0
-  - **s_j** = p_j / (u_j + ε)
-- 选择 s_j 最高的 top-k patch，生成二值 mask
-- 支持三种遮蔽模式：mean / zero / blur
-
-### 3.4 MaskedPGD ([spag/models/perturber.py](spag/models/perturber.py))
-
-- 仅在 mask 标记区域内执行 PGD 优化
-- 优化目标（最小化）：
-  ```
-  L = −L_rec(R(E(x')), x) + λ_u·(1 − cos(E(x'), z)) + λ_s·TV(M⊙δ)
-  ```
-  即：最大化重建误差 + 最小化 embedding 漂移 + 平滑正则
-- 扰动约束：L∞ ≤ ε（默认 ~8/255）
-- 默认 10 步 PGD
-
-### 3.5 评估指标 ([spag/eval/metrics.py](spag/eval/metrics.py))
-
-| 指标 | 类型 | 防御成功方向 | 说明 |
-|------|------|:---:|------|
-| PSNR | 隐私 | ↓ | 重建图 vs 原图的峰值信噪比 |
-| SSIM | 隐私 | ↓ | 结构相似性 |
-| LPIPS | 隐私 | ↑ | 感知距离 |
-| MSE | 隐私 | ↑ | 均方误差 |
-| cos_sim | 效用 | → 1 | embedding 余弦相似度（越高越好） |
-| cos_drift | 效用 | → 0 | embedding 漂移（越低越好） |
+> 说明：核心包名已是 `Model`，脚本导入也已切换为 `from Model...`。
 
 ---
 
-## 4. 快速上手
+## 3. 环境准备
 
-### 4.1 环境准备
+建议 Python 3.10。
 
 ```bash
-# 创建 conda 环境（已有可跳过）
-conda create -n spag python=3.10 -y
-conda activate spag
+# 1) 创建并激活环境（示例）
+conda create -n ml_privacy python=3.10 -y
+conda activate ml_privacy
 
-# 安装依赖
+# 2) 安装依赖
 pip install -r requirements.txt
 
-# Windows 用户如遇到 OpenMP 冲突，设置环境变量：
+# 3) Windows 如遇 OpenMP 冲突
 set KMP_DUPLICATE_LIB_OK=TRUE
 ```
 
-**核心依赖**：PyTorch ≥ 1.10、open_clip_torch、lpips、pytorch_msssim
+---
 
-### 4.2 Step 1 — 训练影子反演模型
+## 4. 如何开启影子模型训练（最新）
 
-准备一个图片目录（任意格式 jpg/png/...），越贴近你的业务域效果越好。
-
-```bash
-python scripts/train_reconstructor.py --data_dir reproduce/IdDecoder/celeba_hq/train --output_dir checkpoints --config configs/default.yaml
-```
-
-- 默认训练 50 epoch，每 5 epoch 保存一次，同时实时保存当前最优模型
-- 支持 `--resume checkpoints/reconstructor_epoch25.pth` 断点恢复
-- 推荐产出：`checkpoints/reconstructor_best.pth`（用于后续防御与基线对比）
-
-### 4.3 Step 2 — 运行 SPAG 防御
+### 4.1 基本训练命令
 
 ```bash
-python scripts/run_defense.py --data_dir reproduce/IdDecoder/celeba_hq/val --reconstructor_ckpt checkpoints/reconstructor_best.pth --output_dir results/defense --num_images 100 --num_vis 20
+python scripts/train_reconstructor.py \
+  --data_dir reproduce/IdDecoder/celeba_hq/train \
+  --output_dir checkpoints \
+  --config configs/default.yaml
 ```
 
-- 对每张图自动执行：打分 → 选区 → PGD 扰动 → 评估指标
-- 前 20 张保存可视化到 `results/defense/visualizations/`
-- 可视化每行：原图 | 扰动图 | mask | 扰动放大 | 原始重建 | 防御后重建
-- 汇总指标保存到 `results/defense/metrics.json`
+### 4.2 常用可选参数
 
-### 4.4 Step 3 — 基线对比实验
+- `--model_type {basic,improved}`：覆盖配置中的重建器类型
+- `--resume <ckpt_path>`：从断点恢复训练
+
+示例（断点续训）：
+
+```bash
+python scripts/train_reconstructor.py \
+  --data_dir reproduce/IdDecoder/celeba_hq/train \
+  --output_dir checkpoints \
+  --config configs/default.yaml \
+  --resume checkpoints/reconstructor_epoch25.pth
+```
+
+### 4.3 训练产物
+
+- 最优模型：`checkpoints/reconstructor_best.pth`
+- 周期保存：`checkpoints/reconstructor_epoch*.pth`
+
+后续防御和基线评估通常使用 `reconstructor_best.pth`。
+
+---
+
+## 5. 最新脚本使用说明
+
+## 5.1 运行完整防御流程（6阶段）
+
+```bash
+python scripts/run_defense.py \
+  --data_dir reproduce/IdDecoder/celeba_hq/val \
+  --reconstructor_ckpt checkpoints/reconstructor_best.pth \
+  --output_dir results/defense \
+  --config configs/default.yaml \
+  --num_images 100 \
+  --num_vis 20
+```
+
+输出：
+
+- `results/defense/metrics.json`：总体与逐图像指标
+- `results/defense/visualizations/`：可视化结果
+
+## 5.2 基线对比评估
 
 ```bash
 python scripts/eval_baseline.py \
-  --data_dir <测试图片目录> \
+  --data_dir reproduce/IdDecoder/celeba_hq/val \
   --reconstructor_ckpt checkpoints/reconstructor_best.pth \
   --output_dir results/baselines \
-  --num_images 50
+  --config configs/default.yaml \
+  --num_images 50 \
+  --noise_sigma 0.05
 ```
 
-将以下 5 种方法进行横向对比：
-1. **no_defense** — 无防御（攻击上界）
-2. **gaussian_img** — 图像加高斯噪声
-3. **gaussian_emb** — embedding 加高斯噪声
-4. **random_mask** — 随机选区 + PGD
-5. **spag** — 本方法（打分选区 + PGD）
+输出：
+
+- `results/baselines/baseline_comparison.json`
+
+基线包含：`no_defense`、`gaussian_img`、`gaussian_emb`、`random_patch`、`recon_only`、`full_pipeline`。
 
 ---
 

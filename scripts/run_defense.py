@@ -1,8 +1,16 @@
-"""Run SPAG defense pipeline and evaluate.
+"""Run the privacy protection pipeline (new 6-stage design).
+
+Pipeline stages:
+  1. Shadow reconstructor (pre-trained, loaded from checkpoint)
+  2. Block-level occlusion sensitivity analysis  →  p_j
+  3. Candidate region screening  →  top-M patches
+  4. VLM semantic privacy judgment  →  q_j  (placeholder / mock)
+  5. Score fusion  →  s_j
+  6. Local adaptive protection  →  x'
 
 Usage:
     python scripts/run_defense.py --data_dir <image_folder> \
-        --reconstructor_ckpt checkpoints/reconstructor_epoch50.pth \
+        --reconstructor_ckpt checkpoints/reconstructor_best.pth \
         [--output_dir results/defense] [--num_images 100]
 """
 import argparse
@@ -12,17 +20,55 @@ import sys
 import time
 
 import torch
+import torch.nn.functional as F
 import torchvision.utils as vutils
 import yaml
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from spag.models.encoder import CLIPEncoder
-from spag.models.reconstructor import Reconstructor
-from spag.models.selector import OcclusionSelector
-from spag.models.perturber import MaskedPGD
-from spag.data.dataset import ImageDataset
-from spag.eval.metrics import compute_all_metrics
+from Model.models.encoder import CLIPEncoder
+from Model.models.reconstructor import Reconstructor, ImprovedReconstructor
+from Model.models.selector import OcclusionAnalyzer
+from Model.models.vlm import MockVLMJudge
+from Model.models.fusion import ScoreFusion
+from Model.models.protector import AdaptiveProtector
+from Model.data.dataset import ImageDataset
+from Model.eval.metrics import compute_all_metrics
+
+
+def load_reconstructor(ckpt_path, config, device):
+    """Load reconstructor from checkpoint, auto-detecting model type."""
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    model_type = ckpt.get('model_type', 'basic')
+    print(f"Loading {model_type} reconstructor from {ckpt_path}")
+
+    if model_type == 'improved':
+        rec_cfg = config['reconstructor']
+        model = ImprovedReconstructor(
+            embed_dim=rec_cfg['embed_dim'],
+            base_channels=rec_cfg['base_channels'],
+            num_res_blocks=rec_cfg.get('num_res_blocks', 2),
+            dropout=0.0,
+            attention_resolutions=tuple(
+                rec_cfg.get('attention_resolutions', [7, 14])
+            ),
+        )
+    else:
+        model = Reconstructor(
+            embed_dim=config['reconstructor']['embed_dim'],
+            base_channels=config['reconstructor']['base_channels'],
+        )
+
+    if 'ema_state_dict' in ckpt:
+        model.load_state_dict(ckpt['ema_state_dict'])
+        print("  Using EMA weights")
+    else:
+        model.load_state_dict(ckpt['model_state_dict'])
+
+    model = model.to(device).eval()
+    for p in model.parameters():
+        p.requires_grad = False
+    return model
 
 
 def run_defense(args):
@@ -32,40 +78,49 @@ def run_defense(args):
     with open(args.config) as f:
         config = yaml.safe_load(f)
 
-    # ---- Load models ----
+    # ======== Load Models ========
     print("Loading CLIP encoder...")
     encoder = CLIPEncoder(
         model_id=config['encoder']['model_id'],
         device=device,
     )
 
-    print("Loading reconstructor...")
-    reconstructor = Reconstructor(
-        embed_dim=config['reconstructor']['embed_dim'],
-        base_channels=config['reconstructor']['base_channels'],
-    ).to(device)
-    ckpt = torch.load(args.reconstructor_ckpt, map_location=device, weights_only=False)
-    reconstructor.load_state_dict(ckpt['model_state_dict'])
-    reconstructor.eval()
-    for p in reconstructor.parameters():
-        p.requires_grad = False
+    reconstructor = load_reconstructor(
+        args.reconstructor_ckpt, config, device)
 
-    # ---- Defense modules ----
-    selector = OcclusionSelector(
-        patch_size=config['selector']['patch_size'],
-        top_k_ratio=config['selector']['top_k_ratio'],
-        mode=config['selector']['occlusion_mode'],
-        eps=config['selector']['eps'],
-    )
-    perturber = MaskedPGD(
-        epsilon=config['perturber']['epsilon'],
-        alpha=config['perturber']['alpha'],
-        num_steps=config['perturber']['num_steps'],
-        lambda_util=config['perturber']['lambda_util'],
-        lambda_smooth=config['perturber']['lambda_smooth'],
+    # ======== Initialize Pipeline Modules ========
+    sel_cfg = config.get('analyzer', config.get('selector', {}))
+    analyzer = OcclusionAnalyzer(
+        patch_size=sel_cfg.get('patch_size', 16),
+        occlusion_mode=sel_cfg.get('occlusion_mode', 'mean'),
+        loss_fn=sel_cfg.get('loss_fn', 'l1'),
+        batch_size=sel_cfg.get('batch_size', 64),
     )
 
-    # ---- Dataset ----
+    vlm_cfg = config.get('vlm', {})
+    vlm_judge = MockVLMJudge(
+        patch_size=sel_cfg.get('patch_size', 16),
+        default_score=vlm_cfg.get('default_score', 0.5),
+        default_action=vlm_cfg.get('default_action', 'noise'),
+    )
+
+    fusion_cfg = config.get('fusion', {})
+    fusion = ScoreFusion(
+        alpha=fusion_cfg.get('alpha', 1.0),
+        beta=fusion_cfg.get('beta', 1.0),
+        mode=fusion_cfg.get('mode', 'multiplicative'),
+    )
+
+    prot_cfg = config.get('protector', {})
+    protector = AdaptiveProtector(
+        patch_size=sel_cfg.get('patch_size', 16),
+        epsilon_min=prot_cfg.get('epsilon_min', 0.02),
+        epsilon_scale=prot_cfg.get('epsilon_scale', 0.15),
+        blur_kernel_size=prot_cfg.get('blur_kernel_size', 7),
+        mosaic_block=prot_cfg.get('mosaic_block', 4),
+    )
+
+    # ======== Dataset ========
     dataset = ImageDataset(args.data_dir, image_size=224)
     num_images = min(len(dataset), args.num_images)
     print(f"Processing {num_images} images from {args.data_dir}")
@@ -74,30 +129,42 @@ def run_defense(args):
     vis_dir = os.path.join(args.output_dir, 'visualizations')
     os.makedirs(vis_dir, exist_ok=True)
 
+    top_m_ratio = sel_cfg.get('top_m_ratio', 0.3)
+    top_k_ratio = sel_cfg.get('top_k_ratio', 0.15)
+    total_patches = (224 // sel_cfg.get('patch_size', 16)) ** 2
     all_metrics = []
 
     for idx in range(num_images):
         t0 = time.time()
         image = dataset[idx].unsqueeze(0).to(device)
 
-        # 1. Original embedding
+        # ---- Phase 1: baseline encoding ----
         z_orig = encoder.encode(image)
 
-        # 2. Score patches
-        scores, u_scores, p_scores = selector.score_patches(
-            image, encoder, reconstructor)
+        # ---- Phase 2: occlusion sensitivity analysis ----
+        p_scores = analyzer.compute_sensitivity(image, encoder, reconstructor)
 
-        # 3. Select top-k patches → mask
-        mask = selector.select_top_k(scores, image.shape)
+        # ---- Phase 3: candidate screening ----
+        candidates = analyzer.select_candidates(p_scores, top_m_ratio)
 
-        # 4. Masked PGD perturbation
-        image_perturbed = perturber.perturb(
-            image, mask, z_orig, encoder, reconstructor)
+        # ---- Phase 4: VLM semantic privacy judgment ----
+        candidates = vlm_judge.judge_patches(image, candidates)
 
-        # 5. Protected embedding
-        z_protected = encoder.encode(image_perturbed)
+        # ---- Phase 5: score fusion ----
+        candidates = fusion.fuse(candidates)
+        selected = fusion.select_final(
+            candidates, top_k_ratio=top_k_ratio,
+            total_patches=total_patches)
 
-        # 6. Evaluate
+        # ---- Phase 6: local adaptive protection ----
+        image_protected = protector.protect_image(
+            image, selected,
+            default_action=vlm_cfg.get('default_action', 'noise'))
+
+        # ---- Encode protected image ----
+        z_protected = encoder.encode(image_protected)
+
+        # ---- Evaluate ----
         with torch.no_grad():
             recon_orig = reconstructor(z_orig.float())
             recon_protected = reconstructor(z_protected.float())
@@ -106,16 +173,18 @@ def run_defense(args):
             image, recon_orig, recon_protected, z_orig, z_protected)
         metrics['image_idx'] = idx
         metrics['time_sec'] = time.time() - t0
+        metrics['num_candidates'] = len(candidates)
+        metrics['num_protected'] = len(selected)
         all_metrics.append(metrics)
 
-        # 7. Save visualizations (first N images)
+        # ---- Visualization ----
         if idx < args.num_vis:
-            # Row: original | perturbed | mask | recon_orig | recon_protected
+            mask = protector.build_mask(selected, image.shape).to(device)
             mask_vis = mask.expand_as(image)
-            perturbation_vis = ((image_perturbed - image).abs() * 10).clamp(0, 1)
+            diff_vis = ((image_protected - image).abs() * 10).clamp(0, 1)
             grid = torch.cat([
-                image, image_perturbed, mask_vis,
-                perturbation_vis, recon_orig, recon_protected
+                image, image_protected, mask_vis,
+                diff_vis, recon_orig, recon_protected,
             ], dim=0)
             vutils.save_image(
                 grid,
@@ -124,20 +193,21 @@ def run_defense(args):
             )
 
         print(f"[{idx+1}/{num_images}] "
+              f"patches={len(selected)}/{total_patches}  "
               f"cos_drift={metrics['cos_drift']:.4f}  "
-              f"psnr_orig={metrics['psnr_orig']:.2f}  "
               f"psnr_prot={metrics['psnr_protected']:.2f}  "
-              f"lpips_orig={metrics['lpips_orig']:.4f}  "
               f"lpips_prot={metrics['lpips_protected']:.4f}  "
               f"time={metrics['time_sec']:.2f}s")
 
-    # ---- Summary ----
+    # ======== Summary ========
     print("\n" + "=" * 60)
     print("AVERAGE METRICS")
     print("=" * 60)
 
     summary = {}
-    metric_keys = [k for k in all_metrics[0] if k not in ('image_idx', 'time_sec')]
+    metric_keys = [k for k in all_metrics[0]
+                   if k not in ('image_idx', 'time_sec',
+                                'num_candidates', 'num_protected')]
     for key in metric_keys:
         vals = [m[key] for m in all_metrics]
         summary[key] = sum(vals) / len(vals)
@@ -145,9 +215,11 @@ def run_defense(args):
 
     summary['total_time'] = sum(m['time_sec'] for m in all_metrics)
     summary['avg_time'] = summary['total_time'] / num_images
+    summary['avg_protected_patches'] = sum(
+        m['num_protected'] for m in all_metrics) / num_images
     print(f"  {'avg_time':20s}: {summary['avg_time']:.2f}s")
+    print(f"  {'avg_protected':20s}: {summary['avg_protected_patches']:.1f} patches")
 
-    # Save results
     results_path = os.path.join(args.output_dir, 'metrics.json')
     with open(results_path, 'w') as f:
         json.dump({'summary': summary, 'per_image': all_metrics}, f, indent=2)
@@ -155,7 +227,8 @@ def run_defense(args):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Run SPAG defense')
+    parser = argparse.ArgumentParser(
+        description='Run privacy protection pipeline')
     parser.add_argument('--data_dir', type=str, required=True)
     parser.add_argument('--reconstructor_ckpt', type=str, required=True)
     parser.add_argument('--output_dir', type=str, default='results/defense')

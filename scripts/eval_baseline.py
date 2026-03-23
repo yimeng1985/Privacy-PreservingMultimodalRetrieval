@@ -1,15 +1,16 @@
-"""Evaluate baselines for comparison with SPAG defense.
+"""Evaluate baselines for comparison with the new privacy protection pipeline.
 
 Baselines:
-  1. no_defense:  original embedding (attack upper bound)
-  2. gaussian_img:  add Gaussian noise to image before encoding
+  1. no_defense:    original embedding (attack upper bound)
+  2. gaussian_img:  add Gaussian noise to full image before encoding
   3. gaussian_emb:  add Gaussian noise to embedding directly
-  4. random_mask:   randomly mask patches (no scoring)
-  5. spag:          our method (occlusion scoring + masked PGD)
+  4. random_patch:  randomly select patches + default protection
+  5. recon_only:    our method with only p_j (no VLM, uniform q)
+  6. full_pipeline: our full method (mock VLM for automated testing)
 
 Usage:
     python scripts/eval_baseline.py --data_dir <image_folder> \
-        --reconstructor_ckpt checkpoints/reconstructor_epoch50.pth
+        --reconstructor_ckpt checkpoints/reconstructor_best.pth
 """
 import argparse
 import json
@@ -22,28 +23,47 @@ import yaml
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from spag.models.encoder import CLIPEncoder
-from spag.models.reconstructor import Reconstructor
-from spag.models.selector import OcclusionSelector
-from spag.models.perturber import MaskedPGD
-from spag.data.dataset import ImageDataset
-from spag.eval.metrics import compute_all_metrics
+from Model.models.encoder import CLIPEncoder
+from Model.models.reconstructor import Reconstructor, ImprovedReconstructor
+from Model.models.selector import OcclusionAnalyzer
+from Model.models.vlm import MockVLMJudge
+from Model.models.fusion import ScoreFusion
+from Model.models.protector import AdaptiveProtector
+from Model.data.dataset import ImageDataset
+from Model.eval.metrics import compute_all_metrics
 
 
-def make_random_mask(image_shape, patch_size, ratio, device):
-    """Generate a random binary patch mask."""
-    _, _, H, W = image_shape
-    nh, nw = H // patch_size, W // patch_size
-    num_patches = nh * nw
-    k = max(1, int(num_patches * ratio))
+def load_reconstructor(ckpt_path, config, device):
+    """Load reconstructor from checkpoint."""
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    model_type = ckpt.get('model_type', 'basic')
 
-    indices = torch.randperm(num_patches, device=device)[:k]
-    mask = torch.zeros(1, 1, H, W, device=device)
-    for idx in indices:
-        i, j = idx // nw, idx % nw
-        mask[:, :, i*patch_size:(i+1)*patch_size,
-             j*patch_size:(j+1)*patch_size] = 1.0
-    return mask
+    if model_type == 'improved':
+        rec_cfg = config['reconstructor']
+        model = ImprovedReconstructor(
+            embed_dim=rec_cfg['embed_dim'],
+            base_channels=rec_cfg['base_channels'],
+            num_res_blocks=rec_cfg.get('num_res_blocks', 2),
+            dropout=0.0,
+            attention_resolutions=tuple(
+                rec_cfg.get('attention_resolutions', [7, 14])
+            ),
+        )
+    else:
+        model = Reconstructor(
+            embed_dim=config['reconstructor']['embed_dim'],
+            base_channels=config['reconstructor']['base_channels'],
+        )
+
+    if 'ema_state_dict' in ckpt:
+        model.load_state_dict(ckpt['ema_state_dict'])
+    else:
+        model.load_state_dict(ckpt['model_state_dict'])
+
+    model = model.to(device).eval()
+    for p in model.parameters():
+        p.requires_grad = False
+    return model
 
 
 def evaluate_baselines(args):
@@ -58,41 +78,39 @@ def evaluate_baselines(args):
         model_id=config['encoder']['model_id'],
         device=device,
     )
-    reconstructor = Reconstructor(
-        embed_dim=config['reconstructor']['embed_dim'],
-        base_channels=config['reconstructor']['base_channels'],
-    ).to(device)
-    ckpt = torch.load(args.reconstructor_ckpt, map_location=device, weights_only=False)
-    reconstructor.load_state_dict(ckpt['model_state_dict'])
-    reconstructor.eval()
-    for p in reconstructor.parameters():
-        p.requires_grad = False
+    reconstructor = load_reconstructor(
+        args.reconstructor_ckpt, config, device)
 
-    # Defense components (for SPAG baseline)
-    selector = OcclusionSelector(
-        patch_size=config['selector']['patch_size'],
-        top_k_ratio=config['selector']['top_k_ratio'],
-        mode=config['selector']['occlusion_mode'],
-        eps=config['selector']['eps'],
+    # Pipeline components
+    sel_cfg = config.get('analyzer', config.get('selector', {}))
+    patch_size = sel_cfg.get('patch_size', 16)
+    top_m_ratio = sel_cfg.get('top_m_ratio', 0.3)
+    top_k_ratio = sel_cfg.get('top_k_ratio', 0.15)
+
+    analyzer = OcclusionAnalyzer(
+        patch_size=patch_size,
+        occlusion_mode=sel_cfg.get('occlusion_mode', 'mean'),
+        batch_size=sel_cfg.get('batch_size', 64),
     )
-    perturber = MaskedPGD(
-        epsilon=config['perturber']['epsilon'],
-        alpha=config['perturber']['alpha'],
-        num_steps=config['perturber']['num_steps'],
-        lambda_util=config['perturber']['lambda_util'],
-        lambda_smooth=config['perturber']['lambda_smooth'],
+    vlm_judge = MockVLMJudge(patch_size=patch_size, default_score=0.5)
+    fusion = ScoreFusion(alpha=1.0, beta=1.0, mode='multiplicative')
+
+    prot_cfg = config.get('protector', {})
+    protector = AdaptiveProtector(
+        patch_size=patch_size,
+        epsilon_min=prot_cfg.get('epsilon_min', 0.02),
+        epsilon_scale=prot_cfg.get('epsilon_scale', 0.15),
     )
 
     dataset = ImageDataset(args.data_dir, image_size=224)
     num_images = min(len(dataset), args.num_images)
-
     noise_sigma = args.noise_sigma
-    patch_size = config['selector']['patch_size']
-    top_k_ratio = config['selector']['top_k_ratio']
+    nh = nw = 224 // patch_size
+    total_patches = nh * nw
 
     results = {name: [] for name in [
         'no_defense', 'gaussian_img', 'gaussian_emb',
-        'random_mask', 'spag'
+        'random_patch', 'recon_only', 'full_pipeline',
     ]}
 
     for idx in range(num_images):
@@ -102,12 +120,12 @@ def evaluate_baselines(args):
         with torch.no_grad():
             recon_orig = reconstructor(z_orig.float())
 
-        # --- Baseline 1: No defense ---
+        # --- 1. No defense ---
         m = compute_all_metrics(image, recon_orig, recon_orig,
                                 z_orig, z_orig)
         results['no_defense'].append(m)
 
-        # --- Baseline 2: Gaussian noise on image ---
+        # --- 2. Gaussian noise on image ---
         noise = torch.randn_like(image) * noise_sigma
         noisy_img = torch.clamp(image + noise, 0, 1)
         z_noisy = encoder.encode(noisy_img)
@@ -117,7 +135,7 @@ def evaluate_baselines(args):
                                 z_orig, z_noisy)
         results['gaussian_img'].append(m)
 
-        # --- Baseline 3: Gaussian noise on embedding ---
+        # --- 3. Gaussian noise on embedding ---
         z_emb_noisy = z_orig + torch.randn_like(z_orig) * noise_sigma
         z_emb_noisy = F.normalize(z_emb_noisy, dim=-1)
         with torch.no_grad():
@@ -126,29 +144,56 @@ def evaluate_baselines(args):
                                 z_orig, z_emb_noisy)
         results['gaussian_emb'].append(m)
 
-        # --- Baseline 4: Random patch masking + PGD ---
-        rand_mask = make_random_mask(image.shape, patch_size,
-                                     top_k_ratio, device)
-        img_rand = perturber.perturb(image, rand_mask, z_orig,
-                                     encoder, reconstructor)
+        # --- 4. Random patch selection + protection ---
+        k = max(1, int(total_patches * top_k_ratio))
+        rand_idx = torch.randperm(total_patches)[:k]
+        rand_patches = []
+        for ri in rand_idx:
+            row = ri.item() // nw
+            col = ri.item() % nw
+            rand_patches.append({
+                'row': row, 'col': col,
+                'y0': row * patch_size, 'y1': (row + 1) * patch_size,
+                'x0': col * patch_size, 'x1': (col + 1) * patch_size,
+                's_score': 0.5, 'action': 'noise',
+            })
+        img_rand = protector.protect_image(image, rand_patches)
         z_rand = encoder.encode(img_rand)
         with torch.no_grad():
             recon_rand = reconstructor(z_rand.float())
         m = compute_all_metrics(image, recon_orig, recon_rand,
                                 z_orig, z_rand)
-        results['random_mask'].append(m)
+        results['random_patch'].append(m)
 
-        # --- Baseline 5: SPAG (our method) ---
-        scores, _, _ = selector.score_patches(image, encoder, reconstructor)
-        mask = selector.select_top_k(scores, image.shape)
-        img_spag = perturber.perturb(image, mask, z_orig,
-                                     encoder, reconstructor)
-        z_spag = encoder.encode(img_spag)
+        # --- 5. Reconstruction-only selection (no VLM) ---
+        p_scores = analyzer.compute_sensitivity(image, encoder, reconstructor)
+        cands = analyzer.select_candidates(p_scores, top_m_ratio)
+        # Assign uniform q_score = 1.0 (skip VLM)
+        for c in cands:
+            c['q_score'] = 1.0
+            c['action'] = 'noise'
+        cands = fusion.fuse(cands)
+        sel = fusion.select_final(cands, top_k_ratio, total_patches)
+        img_recon_only = protector.protect_image(image, sel)
+        z_recon_only = encoder.encode(img_recon_only)
         with torch.no_grad():
-            recon_spag = reconstructor(z_spag.float())
-        m = compute_all_metrics(image, recon_orig, recon_spag,
-                                z_orig, z_spag)
-        results['spag'].append(m)
+            recon_ro = reconstructor(z_recon_only.float())
+        m = compute_all_metrics(image, recon_orig, recon_ro,
+                                z_orig, z_recon_only)
+        results['recon_only'].append(m)
+
+        # --- 6. Full pipeline (mock VLM) ---
+        cands2 = analyzer.select_candidates(p_scores, top_m_ratio)
+        cands2 = vlm_judge.judge_patches(image, cands2)
+        cands2 = fusion.fuse(cands2)
+        sel2 = fusion.select_final(cands2, top_k_ratio, total_patches)
+        img_full = protector.protect_image(image, sel2)
+        z_full = encoder.encode(img_full)
+        with torch.no_grad():
+            recon_full = reconstructor(z_full.float())
+        m = compute_all_metrics(image, recon_orig, recon_full,
+                                z_orig, z_full)
+        results['full_pipeline'].append(m)
 
         if (idx + 1) % 10 == 0:
             print(f"  Processed {idx+1}/{num_images}")
