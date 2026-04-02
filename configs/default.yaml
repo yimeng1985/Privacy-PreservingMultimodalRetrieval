@@ -24,15 +24,21 @@ training:
 
 # Phase 2 & 3: Occlusion analysis and candidate screening
 analyzer:
-  patch_size: 16           # ViT-L/14 natural patch = 14, use 16 for clean division
+  patch_size: 56           # ViT-L/14 natural patch = 14, use 16 for clean division
   occlusion_mode: "mean"   # "mean", "zero", "blur"
   loss_fn: "l1"            # "l1", "l2", "l1+l2"
   batch_size: 64
   top_m_ratio: 0.3         # Phase 3: fraction of patches as candidates
-  top_k_ratio: 0.15        # Phase 5: fraction of total patches to protect
+  top_k_ratio: 0.45        # Phase 5: fraction of total patches to protect
+  center_prior_weight: 0.3 # spatial prior blend (0=off, 1=full prior)
+  center_prior_sigma: 0.4  # Gaussian spread (smaller=tighter to center)
 
 # Phase 4: VLM semantic privacy judgment
 vlm:
+  backend: "mock"          # "mock" for testing, "qwen" for DashScope Qwen-VL
+  model: "qwen3.5-plus"   # DashScope model name (used when backend=qwen)
+  # api_key: null          # set via DASHSCOPE_API_KEY env var (recommended)
+  max_retries: 3           # API call retry count
   default_score: 0.5       # MockVLMJudge default (override with real VLM)
   default_action: "noise"  # default protection action
   context_margin: 1        # extra patches around target for context
@@ -45,7 +51,7 @@ fusion:
 
 # Phase 6: Adaptive protection
 protector:
-  epsilon_min: 0.02        # minimum protection strength
-  epsilon_scale: 0.15      # score-based strength scaling
+  epsilon_min: 0.05        # minimum protection strength
+  epsilon_scale: 0.30      # score-based strength scaling
   blur_kernel_size: 7
   mosaic_block: 4

@@ -18,6 +18,9 @@ def __getattr__(name):
     elif name == 'MockVLMJudge':
         from .vlm import MockVLMJudge
         return MockVLMJudge
+    elif name == 'QwenVLMJudge':
+        from .vlm import QwenVLMJudge
+        return QwenVLMJudge
     elif name == 'ScoreFusion':
         from .fusion import ScoreFusion
         return ScoreFusion

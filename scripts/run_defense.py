@@ -29,7 +29,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from Model.models.encoder import CLIPEncoder
 from Model.models.reconstructor import Reconstructor, ImprovedReconstructor
 from Model.models.selector import OcclusionAnalyzer
-from Model.models.vlm import MockVLMJudge
+from Model.models.vlm import MockVLMJudge, QwenVLMJudge
 from Model.models.fusion import ScoreFusion
 from Model.models.protector import AdaptiveProtector
 from Model.data.dataset import ImageDataset
@@ -95,14 +95,28 @@ def run_defense(args):
         occlusion_mode=sel_cfg.get('occlusion_mode', 'mean'),
         loss_fn=sel_cfg.get('loss_fn', 'l1'),
         batch_size=sel_cfg.get('batch_size', 64),
+        center_prior_weight=sel_cfg.get('center_prior_weight', 0.3),
+        center_prior_sigma=sel_cfg.get('center_prior_sigma', 0.4),
     )
 
     vlm_cfg = config.get('vlm', {})
-    vlm_judge = MockVLMJudge(
-        patch_size=sel_cfg.get('patch_size', 16),
-        default_score=vlm_cfg.get('default_score', 0.5),
-        default_action=vlm_cfg.get('default_action', 'noise'),
-    )
+    vlm_backend = args.vlm_backend or vlm_cfg.get('backend', 'mock')
+    if vlm_backend == 'qwen':
+        print("Using QwenVLMJudge (DashScope API)")
+        vlm_judge = QwenVLMJudge(
+            patch_size=sel_cfg.get('patch_size', 16),
+            context_margin=vlm_cfg.get('context_margin', 1),
+            api_key=vlm_cfg.get('api_key') or os.environ.get('DASHSCOPE_API_KEY'),
+            model=vlm_cfg.get('model', 'qwen3.5-plus'),
+            max_retries=vlm_cfg.get('max_retries', 3),
+        )
+    else:
+        print("Using MockVLMJudge (testing mode)")
+        vlm_judge = MockVLMJudge(
+            patch_size=sel_cfg.get('patch_size', 16),
+            default_score=vlm_cfg.get('default_score', 0.5),
+            default_action=vlm_cfg.get('default_action', 'noise'),
+        )
 
     fusion_cfg = config.get('fusion', {})
     fusion = ScoreFusion(
@@ -236,5 +250,8 @@ if __name__ == '__main__':
     parser.add_argument('--num_images', type=int, default=100)
     parser.add_argument('--num_vis', type=int, default=20,
                         help='Number of images to save visualizations for')
+    parser.add_argument('--vlm_backend', type=str, default=None,
+                        choices=['mock', 'qwen'],
+                        help='VLM backend: mock (default) or qwen (DashScope)')
     args = parser.parse_args()
     run_defense(args)

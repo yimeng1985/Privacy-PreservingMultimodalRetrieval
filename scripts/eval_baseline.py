@@ -26,7 +26,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from Model.models.encoder import CLIPEncoder
 from Model.models.reconstructor import Reconstructor, ImprovedReconstructor
 from Model.models.selector import OcclusionAnalyzer
-from Model.models.vlm import MockVLMJudge
+from Model.models.vlm import MockVLMJudge, QwenVLMJudge
 from Model.models.fusion import ScoreFusion
 from Model.models.protector import AdaptiveProtector
 from Model.data.dataset import ImageDataset
@@ -91,8 +91,19 @@ def evaluate_baselines(args):
         patch_size=patch_size,
         occlusion_mode=sel_cfg.get('occlusion_mode', 'mean'),
         batch_size=sel_cfg.get('batch_size', 64),
+        center_prior_weight=sel_cfg.get('center_prior_weight', 0.3),
+        center_prior_sigma=sel_cfg.get('center_prior_sigma', 0.4),
     )
-    vlm_judge = MockVLMJudge(patch_size=patch_size, default_score=0.5)
+    vlm_cfg = config.get('vlm', {})
+    vlm_backend = args.vlm_backend or vlm_cfg.get('backend', 'mock')
+    if vlm_backend == 'qwen':
+        vlm_judge = QwenVLMJudge(
+            patch_size=patch_size,
+            api_key=vlm_cfg.get('api_key') or os.environ.get('DASHSCOPE_API_KEY'),
+            model=vlm_cfg.get('model', 'qwen3.5-plus'),
+        )
+    else:
+        vlm_judge = MockVLMJudge(patch_size=patch_size, default_score=0.5)
     fusion = ScoreFusion(alpha=1.0, beta=1.0, mode='multiplicative')
 
     prot_cfg = config.get('protector', {})
@@ -237,5 +248,8 @@ if __name__ == '__main__':
     parser.add_argument('--num_images', type=int, default=50)
     parser.add_argument('--noise_sigma', type=float, default=0.05,
                         help='Noise std for Gaussian baselines')
+    parser.add_argument('--vlm_backend', type=str, default=None,
+                        choices=['mock', 'qwen'],
+                        help='VLM backend: mock (default) or qwen (DashScope)')
     args = parser.parse_args()
     evaluate_baselines(args)

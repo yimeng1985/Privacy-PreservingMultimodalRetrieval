@@ -24,18 +24,38 @@ class OcclusionAnalyzer:
     """
 
     def __init__(self, patch_size=16, occlusion_mode='mean',
-                 loss_fn='l1', batch_size=64):
+                 loss_fn='l1', batch_size=64,
+                 center_prior_weight=0.3, center_prior_sigma=0.4):
         """
         Args:
-            patch_size:      size of each square patch (pixels)
-            occlusion_mode:  how to fill occluded patches ('mean', 'zero', 'blur')
-            loss_fn:         reconstruction loss type ('l1', 'l2', 'l1+l2')
-            batch_size:      sub-batch size for processing occluded images
+            patch_size:           size of each square patch (pixels)
+            occlusion_mode:       how to fill occluded patches ('mean', 'zero', 'blur')
+            loss_fn:              reconstruction loss type ('l1', 'l2', 'l1+l2')
+            batch_size:           sub-batch size for processing occluded images
+            center_prior_weight:  blend weight for spatial center prior (0=off, 1=full)
+            center_prior_sigma:   Gaussian spread (fraction of image, smaller=tighter)
         """
         self.patch_size = patch_size
         self.occlusion_mode = occlusion_mode
         self.loss_fn = loss_fn
         self.batch_size = batch_size
+        self.center_prior_weight = center_prior_weight
+        self.center_prior_sigma = center_prior_sigma
+
+    def _build_center_prior(self, nh, nw, device):
+        """Build a 2D Gaussian spatial prior centered on the image.
+
+        Returns:
+            prior: (nh, nw) tensor in [0, 1], peak at center
+        """
+        sigma = self.center_prior_sigma
+        rows = torch.linspace(-1, 1, nh, device=device)
+        cols = torch.linspace(-1, 1, nw, device=device)
+        gy, gx = torch.meshgrid(rows, cols, indexing='ij')
+        prior = torch.exp(-(gx ** 2 + gy ** 2) / (2 * sigma ** 2))
+        # Normalize to [0, 1]
+        prior = prior / prior.max()
+        return prior
 
     def _occlude_patch(self, image, row, col):
         """Create image copy with patch at (row, col) occluded."""
@@ -114,7 +134,19 @@ class OcclusionAnalyzer:
         # Clamp: negative values mean occlusion helped reconstruction (not useful)
         p_scores = p_scores.clamp(min=0.0)
 
-        return p_scores.view(nh, nw)
+        p_scores = p_scores.view(nh, nw)
+
+        # Apply spatial center prior: boost scores near image center
+        if self.center_prior_weight > 0:
+            prior = self._build_center_prior(nh, nw, device)
+            # Blend: p' = (1 - w) * p_norm + w * prior, then scale back
+            p_max = p_scores.max()
+            if p_max > 1e-8:
+                p_norm = p_scores / p_max
+                p_scores = ((1 - self.center_prior_weight) * p_norm
+                            + self.center_prior_weight * prior) * p_max
+
+        return p_scores
 
     def select_candidates(self, p_scores, top_m_ratio=0.3, min_candidates=3):
         """Select top-M candidate patches by reconstruction sensitivity.

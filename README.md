@@ -51,8 +51,6 @@ GraduationProject/
 └── README.md
 ```
 
-> 说明：核心包名已是 `Model`，脚本导入也已切换为 `from Model...`。
-
 ---
 
 ## 3. 环境准备
@@ -113,13 +111,7 @@ python scripts/train_reconstructor.py \
 ## 5.1 运行完整防御流程（6阶段）
 
 ```bash
-python scripts/run_defense.py \
-  --data_dir reproduce/IdDecoder/celeba_hq/val \
-  --reconstructor_ckpt checkpoints/reconstructor_best.pth \
-  --output_dir results/defense \
-  --config configs/default.yaml \
-  --num_images 100 \
-  --num_vis 20
+python scripts/run_defense.py --data_dir reproduce/IdDecoder/celeba_hq/val --reconstructor_ckpt checkpoints/reconstructor_best.pth --output_dir results/defense --config configs/default.yaml --num_images 10 --num_vis 20
 ```
 
 输出：
