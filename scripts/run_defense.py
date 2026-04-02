@@ -32,6 +32,7 @@ from Model.models.selector import OcclusionAnalyzer
 from Model.models.vlm import MockVLMJudge, QwenVLMJudge
 from Model.models.fusion import ScoreFusion
 from Model.models.protector import AdaptiveProtector
+from Model.models.perturber import MaskedPGD
 from Model.data.dataset import ImageDataset
 from Model.eval.metrics import compute_all_metrics
 
@@ -134,6 +135,21 @@ def run_defense(args):
         mosaic_block=prot_cfg.get('mosaic_block', 4),
     )
 
+    pgd_cfg = config.get('pgd', {})
+    use_pgd = pgd_cfg.get('enabled', False)
+    if use_pgd:
+        pgd = MaskedPGD(
+            epsilon=pgd_cfg.get('epsilon', 0.06),
+            alpha=pgd_cfg.get('alpha', 0.008),
+            num_steps=pgd_cfg.get('num_steps', 10),
+            lambda_util=pgd_cfg.get('lambda_util', 1.0),
+            lambda_smooth=pgd_cfg.get('lambda_smooth', 0.01),
+        )
+        print(f"Using MaskedPGD (eps={pgd.epsilon}, steps={pgd.num_steps})")
+    else:
+        pgd = None
+        print("Using simple AdaptiveProtector (noise/blur)")
+
     # ======== Dataset ========
     dataset = ImageDataset(args.data_dir, image_size=224)
     num_images = min(len(dataset), args.num_images)
@@ -171,9 +187,14 @@ def run_defense(args):
             total_patches=total_patches)
 
         # ---- Phase 6: local adaptive protection ----
-        image_protected = protector.protect_image(
-            image, selected,
-            default_action=vlm_cfg.get('default_action', 'noise'))
+        if use_pgd:
+            mask = protector.build_mask(selected, image.shape).to(device)
+            image_protected = pgd.perturb(
+                image, mask, z_orig, encoder, reconstructor)
+        else:
+            image_protected = protector.protect_image(
+                image, selected,
+                default_action=vlm_cfg.get('default_action', 'noise'))
 
         # ---- Encode protected image ----
         z_protected = encoder.encode(image_protected)

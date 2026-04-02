@@ -55,3 +55,12 @@ protector:
   epsilon_scale: 0.30      # score-based strength scaling
   blur_kernel_size: 7
   mosaic_block: 4
+
+# Phase 6 alternative: MaskedPGD adversarial perturbation
+pgd:
+  enabled: true            # true=use PGD, false=use simple noise/blur
+  epsilon: 0.06            # L-inf perturbation budget
+  alpha: 0.008             # PGD step size
+  num_steps: 10            # optimization iterations
+  lambda_util: 1.0         # embedding drift penalty weight
+  lambda_smooth: 0.01      # total variation smoothness weight

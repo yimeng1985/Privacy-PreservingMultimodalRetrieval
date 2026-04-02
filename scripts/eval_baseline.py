@@ -29,6 +29,7 @@ from Model.models.selector import OcclusionAnalyzer
 from Model.models.vlm import MockVLMJudge, QwenVLMJudge
 from Model.models.fusion import ScoreFusion
 from Model.models.protector import AdaptiveProtector
+from Model.models.perturber import MaskedPGD
 from Model.data.dataset import ImageDataset
 from Model.eval.metrics import compute_all_metrics
 
@@ -113,6 +114,19 @@ def evaluate_baselines(args):
         epsilon_scale=prot_cfg.get('epsilon_scale', 0.15),
     )
 
+    pgd_cfg = config.get('pgd', {})
+    use_pgd = pgd_cfg.get('enabled', False)
+    if use_pgd:
+        pgd = MaskedPGD(
+            epsilon=pgd_cfg.get('epsilon', 0.06),
+            alpha=pgd_cfg.get('alpha', 0.008),
+            num_steps=pgd_cfg.get('num_steps', 10),
+            lambda_util=pgd_cfg.get('lambda_util', 1.0),
+            lambda_smooth=pgd_cfg.get('lambda_smooth', 0.01),
+        )
+    else:
+        pgd = None
+
     dataset = ImageDataset(args.data_dir, image_size=224)
     num_images = min(len(dataset), args.num_images)
     noise_sigma = args.noise_sigma
@@ -169,6 +183,9 @@ def evaluate_baselines(args):
                 's_score': 0.5, 'action': 'noise',
             })
         img_rand = protector.protect_image(image, rand_patches)
+        if use_pgd:
+            rand_mask = protector.build_mask(rand_patches, image.shape).to(device)
+            img_rand = pgd.perturb(image, rand_mask, z_orig, encoder, reconstructor)
         z_rand = encoder.encode(img_rand)
         with torch.no_grad():
             recon_rand = reconstructor(z_rand.float())
@@ -185,7 +202,11 @@ def evaluate_baselines(args):
             c['action'] = 'noise'
         cands = fusion.fuse(cands)
         sel = fusion.select_final(cands, top_k_ratio, total_patches)
-        img_recon_only = protector.protect_image(image, sel)
+        if use_pgd:
+            ro_mask = protector.build_mask(sel, image.shape).to(device)
+            img_recon_only = pgd.perturb(image, ro_mask, z_orig, encoder, reconstructor)
+        else:
+            img_recon_only = protector.protect_image(image, sel)
         z_recon_only = encoder.encode(img_recon_only)
         with torch.no_grad():
             recon_ro = reconstructor(z_recon_only.float())
@@ -198,7 +219,11 @@ def evaluate_baselines(args):
         cands2 = vlm_judge.judge_patches(image, cands2)
         cands2 = fusion.fuse(cands2)
         sel2 = fusion.select_final(cands2, top_k_ratio, total_patches)
-        img_full = protector.protect_image(image, sel2)
+        if use_pgd:
+            full_mask = protector.build_mask(sel2, image.shape).to(device)
+            img_full = pgd.perturb(image, full_mask, z_orig, encoder, reconstructor)
+        else:
+            img_full = protector.protect_image(image, sel2)
         z_full = encoder.encode(img_full)
         with torch.no_grad():
             recon_full = reconstructor(z_full.float())
