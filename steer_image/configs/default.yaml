@@ -1,0 +1,53 @@
+# STEER Image Retrieval - Default Configuration
+
+# ============ Encoders ============
+encoders:
+  local:
+    name: "ViT-B-32"
+    pretrained: "laion2b_s34b_b79k"
+    embed_dim: 512
+  server:
+    name: "ViT-L-14"
+    pretrained: "datacomp_xl_s13b_b90k"
+    embed_dim: 768
+
+# ============ Mapper ============
+mapper:
+  type: "mlp"                   # "linear" or "mlp"
+  hidden_dims: [1024, 1024]     # MLP hidden layer sizes (ignored for linear)
+  dropout: 0.1                  # MLP dropout rate
+
+# ============ Dataset ============
+dataset:
+  name: "cifar100"              # "cifar100", "cifar10", "food101", "oxfordpets"
+  data_root: "./steer_image/data"
+  alignment_ratio: 0.5          # fraction of train set used for alignment training
+  num_workers: 4
+
+# ============ Training ============
+training:
+  batch_size: 256
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  num_epochs: 50
+  loss: "mse+cosine"            # "mse", "cosine", "huber", "mse+cosine"
+  cosine_weight: 0.5            # weight for cosine loss when using mse+cosine
+  scheduler: "cosine"           # "cosine", "step", "none"
+  warmup_epochs: 5
+  save_every: 10
+  log_every: 50
+  seed: 42
+
+# ============ Retrieval ============
+retrieval:
+  top_k: [1, 5, 10, 20]
+  index_type: "flatip"          # "flatip" (inner product), "flatl2" (L2)
+  normalize: true               # L2 normalize embeddings before retrieval
+
+# ============ Paths ============
+paths:
+  output_dir: "./steer_image/outputs"
+  embeddings_dir: "./steer_image/outputs/embeddings"
+  checkpoints_dir: "./steer_image/outputs/checkpoints"
+  index_dir: "./steer_image/outputs/index"
+  results_dir: "./steer_image/outputs/results"
